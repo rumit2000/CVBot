@@ -3,8 +3,8 @@
 # - кнопки (Обо мне / Скачать резюме / FAQ / LinkedIn — всегда видна)
 # - FAQ: свой каталог тем, на старте ответы буферизуются из резюме (через локальный RAG)
 #   темы без ответа скрываются
-# - свободные вопросы: Assistants API (File Search) + tools web_search/web_fetch
-# - если ассистент не справился — общий веб-фолбэк или контакты
+# - свободные вопросы: Responses API с контекстом из локального RAG
+# - если в резюме нет ответа — общий веб-фолбэк или контакты
 
 import asyncio
 import os
@@ -427,7 +427,7 @@ def _web_fetch_impl(url: str, max_chars: int = 4000) -> dict:
                           headers={"User-Agent": "Mozilla/5.0"}) as c:
             resp = c.get(url)
             resp.raise_for_status()
-            if any(part in resp.url.lower() for part in BAD_URL_PARTS):
+            if any(part in str(resp.url).lower() for part in BAD_URL_PARTS):
                 return {"url": url, "text": ""}
             doc = lxml_html.fromstring(resp.text)
             for bad in doc.xpath('//script|//style|//noscript'):
@@ -437,77 +437,49 @@ def _web_fetch_impl(url: str, max_chars: int = 4000) -> dict:
     except Exception:
         return {"url": url, "text": ""}
 
-# ========= Assistants API: раннер с tools =========
+# ========= Responses API с локальным RAG-контекстом =========
 async def answer_via_assistant(question: str) -> Optional[str]:
-    if not settings.assistant_id:
+    try:
+        from rag import retrieve as rag_retrieve
+    except Exception:
         return None
 
-    client = OpenAI(api_key=settings.openai_api_key)
     try:
-        thread = client.beta.threads.create()
-        client.beta.threads.messages.create(thread_id=thread.id, role="user", content=question)
-        run = client.beta.threads.runs.create(thread_id=thread.id, assistant_id=settings.assistant_id)
+        ctx_raw = rag_retrieve(question)
+    except Exception:
+        return None
 
-        current_company = await extract_current_company_from_local_index()
+    frags = _norm_ctx(ctx_raw, limit=6)
+    if not frags:
+        return None
 
-        while True:
-            await asyncio.sleep(0.8)
-            run = client.beta.threads.runs.retrieve(thread_id=thread.id, run_id=run.id)
+    context_block = "\n\n".join(
+        f"Фрагмент #{i}:\n{fragment}" for i, fragment in enumerate(frags, start=1)
+    )
+    instructions = (
+        "Ты — помощник по резюме Тимура Асяева. "
+        "Отвечай на русском, кратко и по делу, используя только предоставленные "
+        "фрагменты резюме. Не придумывай факты и не используй внешние знания. "
+        "Если фрагментов недостаточно для надёжного ответа, верни ровно NO_ANSWER."
+    )
+    prompt = (
+        f"Вопрос пользователя:\n{question}\n\n"
+        f"Фрагменты резюме:\n{context_block}"
+    )
 
-            if run.status in ("queued", "in_progress"):
-                continue
-
-            if run.status == "requires_action":
-                tool_calls = run.required_action.submit_tool_outputs.tool_calls
-                outputs = []
-                for call in tool_calls:
-                    name = call.function.name
-                    try:
-                        args = json.loads(call.function.arguments or "{}")
-                    except Exception:
-                        args = {}
-
-                    if name == "web_search":
-                        q = (args.get("query") or "").strip()
-                        k = int(args.get("max_results", 5))
-                        headcount_trigger = any(s in q.lower() for s in [
-                            "headcount","employee","employees","численност","штат","размер компан","сколько человек"
-                        ])
-                        if headcount_trigger and current_company and current_company.lower() not in q.lower():
-                            q = f'{current_company} employees headcount численность сотрудников штат размер компании'
-                        results = _web_search_impl(q, max_results=k)
-                        outputs.append({"tool_call_id": call.id,
-                                        "output": json.dumps(results, ensure_ascii=False)})
-
-                    elif name == "web_fetch":
-                        url = (args.get("url") or "").strip()
-                        max_chars = int(args.get("max_chars", 4000))
-                        result = _web_fetch_impl(url, max_chars=max_chars)
-                        outputs.append({"tool_call_id": call.id,
-                                        "output": json.dumps(result, ensure_ascii=False)})
-
-                    else:
-                        outputs.append({"tool_call_id": call.id,
-                                        "output": json.dumps({"error": "unknown tool"})})
-
-                run = client.beta.threads.runs.submit_tool_outputs(
-                    thread_id=thread.id, run_id=run.id, tool_outputs=outputs
-                )
-                continue
-
-            if run.status == "completed":
-                msgs = client.beta.threads.messages.list(thread_id=thread.id, order="desc", limit=10)
-                for m in msgs.data:
-                    if m.role == "assistant":
-                        parts = []
-                        for c in m.content:
-                            if c.type == "text":
-                                parts.append(c.text.value)
-                        answer = "\n".join(parts).strip()
-                        return answer or None
-                return None
-
+    try:
+        client = OpenAI(api_key=settings.openai_api_key)
+        response = client.responses.create(
+            model=settings.openai_model,
+            instructions=instructions,
+            input=prompt,
+            max_output_tokens=800,
+            store=False,
+        )
+        answer = (response.output_text or "").strip()
+        if not answer or "NO_ANSWER" in answer.upper() or is_empty_message(answer):
             return None
+        return answer
     except Exception:
         return None
 
@@ -721,4 +693,3 @@ def register_handlers(dp: Dispatcher):
 
     # callbacks:
     dp.callback_query.register(cb_onepage, F.data == "onepage")
-

@@ -42,8 +42,9 @@ async def healthz_head():
     return Response(status_code=200)
 
 async def start_health_server():
+    host = os.getenv("HEALTH_HOST", "127.0.0.1")
     port = int(os.getenv("PORT", "10000"))
-    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
+    config = uvicorn.Config(app, host=host, port=port, log_level="info")
     server = uvicorn.Server(config)
     await server.serve()
 
@@ -52,8 +53,8 @@ from bot import register_handlers  # наши хэндлеры/маршруты 
 
 async def delete_webhook_safely(bot: Bot):
     with suppress(Exception):
-        await bot.delete_webhook(drop_pending_updates=True)
-        logger.info("[polling_worker] delete_webhook ok (drop=True)")
+        await bot.delete_webhook(drop_pending_updates=False)
+        logger.info("[polling_worker] delete_webhook ok (drop=False)")
 
 async def run_polling():
     token = settings.telegram_token
