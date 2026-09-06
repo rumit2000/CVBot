@@ -3,5 +3,7 @@ __pycache__/
 *.pyc
 .DS_Store
 .env
+video/.env.i
+video/apikey
 data/about_cache.txt
 data/faq_cache.json
